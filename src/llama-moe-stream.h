@@ -164,6 +164,13 @@ struct llama_moe_stream {
 
     bool debug = false;
 
+    // Optional bounded route trace, exported as a JSON array on destruction.
+    // Guarded by mtx; records selected (layer, expert_id) events in execution order.
+    std::string trace_path;
+    uint64_t trace_max_events = 1'000'000;
+    uint64_t trace_dropped_events = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> trace_events;
+
     struct {
         int64_t n_calls     = 0; // remap invocations
         int64_t n_hit       = 0; // touched experts already resident or loading
@@ -183,6 +190,8 @@ struct llama_moe_stream {
     void worker_loop();
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+    void record_trace_locked(int32_t layer, const int32_t * ids, int64_t n);
+    void write_trace_file();
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
