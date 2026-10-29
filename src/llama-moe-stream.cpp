@@ -165,6 +165,47 @@ llama_moe_stream::~llama_moe_stream() {
     for (auto & w : workers) {
         w.join();
     }
+    write_trace_file();
+}
+
+void llama_moe_stream::record_trace_locked(int32_t layer, const int32_t * ids, int64_t n) {
+    if (trace_path.empty()) {
+        return;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        if (trace_events.size() < trace_max_events) {
+            trace_events.emplace_back((uint32_t) layer, (uint32_t) ids[i]);
+        } else {
+            trace_dropped_events++;
+        }
+    }
+}
+
+void llama_moe_stream::write_trace_file() {
+    if (trace_path.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    std::ofstream out(trace_path, std::ios::out | std::ios::trunc);
+    if (!out) {
+        LLAMA_LOG_WARN("%s: failed to write expert route trace to %s\n", __func__, trace_path.c_str());
+        return;
+    }
+    out << "[\n";
+    for (size_t i = 0; i < trace_events.size(); i++) {
+        const auto & event = trace_events[i];
+        out << "  {\"layer\": " << event.first
+            << ", \"expert_id\": " << event.second << "}";
+        out << (i + 1 == trace_events.size() ? "\n" : ",\n");
+    }
+    out << "]\n";
+    out.close();
+    if (!out) {
+        LLAMA_LOG_WARN("%s: write failed for expert route trace %s\n", __func__, trace_path.c_str());
+        return;
+    }
+    LLAMA_LOG_INFO("%s: wrote %zu expert route trace events to %s (dropped %" PRIu64 " due to cap)\n",
+            __func__, trace_events.size(), trace_path.c_str(), trace_dropped_events);
 }
 
 ggml_tensor * llama_moe_stream::create_cache_tensor(
