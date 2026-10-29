@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 
 #ifdef _WIN32
@@ -146,6 +147,11 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
 
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
     use_direct_io = direct;
+    if (const char * path = std::getenv("LLAMA_MOE_STREAM_TRACE"); path != nullptr && path[0] != '\0') {
+        trace_path = path;
+        LLAMA_LOG_INFO("%s: expert route trace enabled: %s (max events = %" PRIu64 ")\n",
+                __func__, trace_path.c_str(), trace_max_events);
+    }
 }
 
 // stop and join the I/O workers before the cache buffers and files they use are destroyed
