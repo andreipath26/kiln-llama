@@ -507,6 +507,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     }
 
     mgr->stats.n_calls++;
+    mgr->record_trace_locked(sl->il, ids, n);
     mgr->start_workers_locked();
 
     // distinct experts touched by this ubatch, in first-use order
@@ -623,6 +624,7 @@ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint
 // into consecutive groups of plan_capacity, one group per wave (sl.expert_wave[e] = e's wave)
 void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
     stats.n_calls++;
+    record_trace_locked(sl.il, ids, n);
     start_workers_locked();
 
     sl.touched.assign(sl.n_expert, 0);
