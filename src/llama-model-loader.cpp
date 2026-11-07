@@ -18,6 +18,28 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// Expert tensor kinds are shared across llama.cpp model implementations.
+// Keeping the selection here makes lazy expert reads opt-in and architecture
+// agnostic for models represented by the standard GGUF MoE tensor types.
+static bool llama_tensor_is_routed_expert_weight(llm_tensor tensor) {
+    switch (tensor) {
+        case LLM_TENSOR_FFN_DOWN_EXP:
+        case LLM_TENSOR_FFN_GATE_EXP:
+        case LLM_TENSOR_FFN_UP_EXP:
+        case LLM_TENSOR_FFN_NORM_EXPS:
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+        case LLM_TENSOR_FFN_DOWN_CHEXPS:
+        case LLM_TENSOR_FFN_GATE_CHEXPS:
+        case LLM_TENSOR_FFN_UP_CHEXPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -1339,7 +1361,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    const bool opt_in_lazy_expert = lazy.mode == LLAMA_LAZY_MODE_ON &&
+            tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0 &&
+            llama_tensor_is_routed_expert_weight(tn.tensor);
+    if ((flags & TENSOR_READ_LAZY) || opt_in_lazy_expert) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
@@ -1516,7 +1541,8 @@ bool llama_model_loader::load_all_data(
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+    // 64MB works well for NVMe drives
+    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
