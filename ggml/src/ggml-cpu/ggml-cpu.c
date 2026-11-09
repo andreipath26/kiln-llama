@@ -37,6 +37,10 @@
 #include <signal.h>
 #if defined(__linux__)
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
 #endif
 #if defined(__gnu_linux__)
 #include <syscall.h>
@@ -1589,6 +1593,173 @@ static void kiln_advise_selected_moe_experts(
 #endif
 }
 
+// Experimental REAL CPU MoE graph-side external expert loading.
+// Requires a CRC-verified KILN expert sidecar and the compact index emitted
+// by kiln-bench expert-export-stream-index. Only actually selected expert
+// slabs are read via pread; the CPU matmul uses these copied slab bytes, not
+// the original GGUF mmap pages. Enabled explicitly via BOTH env variables.
+// Unsupported layouts or missing entries fall back to original resident
+// tensor bytes, preserving correctness (but NOT claimed as full streaming).
+#if defined(__linux__)
+struct kiln_stream_audit {
+    int requested;
+    int loaded;
+    uint64_t bytes;
+};
+
+static bool kiln_moe_external_configured(void) {
+    const char * blob = getenv("KILN_MOE_STREAM_BLOB");
+    const char * index = getenv("KILN_MOE_STREAM_INDEX");
+    return blob != NULL && blob[0] != '\0' && index != NULL && index[0] != '\0';
+}
+
+static void kiln_stream_set_slot(char (*slots)[CACHE_LINE_SIZE], int id, void * pointer) {
+    // The first cacheline word belongs to the existing atomic work counter.
+    // The second word is reserved for the selected external slab pointer.
+    memcpy(slots[id] + 16, &pointer, sizeof(pointer));
+}
+
+static void * kiln_stream_get_slot(char (*slots)[CACHE_LINE_SIZE], int id) {
+    void * ptr = NULL;
+    memcpy(&ptr, slots[id] + 16, sizeof(ptr));
+    return ptr;
+}
+
+static bool kiln_stream_read_all(int fd, void * destination, uint64_t offset, size_t bytes) {
+    unsigned char * dst = (unsigned char *) destination;
+    size_t cursor = 0;
+    while (cursor < bytes) {
+        const size_t limit = MIN(bytes - cursor, (size_t) (1024 * 1024));
+        ssize_t n = pread(fd, dst + cursor, limit, (off_t) (offset + cursor));
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        cursor += (size_t) n;
+    }
+    return true;
+}
+
+static struct kiln_stream_audit kiln_stream_selected(
+    const struct ggml_tensor * weights,
+    const int64_t * selected_rows,
+    char (*slots)[CACHE_LINE_SIZE]) {
+    struct kiln_stream_audit audit = {0, 0, 0};
+    for (int64_t id = 0; id < weights->ne[2]; ++id) {
+        kiln_stream_set_slot(slots, (int) id, NULL);
+        if (selected_rows[id] != 0) {
+            audit.requested++;
+        }
+    }
+    if (!kiln_moe_external_configured() || audit.requested == 0) {
+        return audit;
+    }
+    if (weights->data == NULL || weights->ne[0] <= 0 ||
+            weights->ne[1] <= 0 || weights->ne[2] <= 0 ||
+            weights->ne[2] > INT32_MAX) {
+        return audit;
+    }
+
+    const size_t row_bytes = ggml_row_size(weights->type, weights->ne[0]);
+    if (row_bytes == 0 || weights->ne[1] > (int64_t) (SIZE_MAX / row_bytes)) {
+        return audit;
+    }
+    const size_t expert_bytes = row_bytes * (size_t) weights->ne[1];
+    // CBLAS, tiled, permuted and padded layouts require separate handling.
+    if (weights->nb[1] != row_bytes || weights->nb[2] != expert_bytes ||
+            expert_bytes == 0) {
+        return audit;
+    }
+    // Bounded temporary allocations: this is a Tier-0 safety constraint.
+    const size_t max_bytes = 256u * 1024u * 1024u;
+    if (expert_bytes > max_bytes) {
+        return audit;
+    }
+    const char * index_file = getenv("KILN_MOE_STREAM_INDEX");
+    const char * blob_file = getenv("KILN_MOE_STREAM_BLOB");
+    FILE * index = fopen(index_file, "rb");
+    if (index == NULL) { return audit; }
+    char header[128];
+    if (fgets(header, sizeof(header), index) == NULL ||
+            strcmp(header, "KILN-MOE-STREAM-1\n") != 0) {
+        fclose(index);
+        return audit;
+    }
+    int fd = open(blob_file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fclose(index);
+        return audit;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        fclose(index);
+        return audit;
+    }
+    const uint64_t blob_size = (uint64_t) st.st_size;
+    char line[256];
+    size_t allocated = 0;
+    // Parsing is bounded by file size and per-op byte allowance. Longer or
+    // malformed lines are skipped; no tensor name or path becomes executable.
+    while (fgets(line, sizeof(line), index) != NULL) {
+        char name[64] = {0};
+        unsigned int id = 0;
+        unsigned long long offset = 0;
+        unsigned long long length = 0;
+        char extra;
+        const int count = sscanf(line, "%63[^\t]\t%u\t%llu\t%llu %c",
+                                 name, &id, &offset, &length, &extra);
+        if (count != 4 || strcmp(name, weights->name) != 0 ||
+                id >= (unsigned int) weights->ne[2] ||
+                selected_rows[id] == 0 || kiln_stream_get_slot(slots, (int) id) != NULL) {
+            continue;
+        }
+        if (length != (unsigned long long) expert_bytes ||
+                offset > blob_size || length > blob_size - offset ||
+                offset > (uint64_t) INT64_MAX - length ||
+                expert_bytes > max_bytes - allocated) {
+            continue;
+        }
+        void * data = NULL;
+        if (posix_memalign(&data, 64, expert_bytes) != 0 || data == NULL) {
+            continue;
+        }
+        if (!kiln_stream_read_all(fd, data, (uint64_t) offset, expert_bytes)) {
+            free(data);
+            continue;
+        }
+        kiln_stream_set_slot(slots, (int) id, data);
+        audit.loaded++;
+        audit.bytes += expert_bytes;
+        allocated += expert_bytes;
+    }
+    fclose(index);
+    close(fd);
+    const char * evidence = getenv("KILN_MOE_STREAM_AUDIT");
+    if (evidence != NULL && evidence[0] != '\0') {
+        FILE * output = fopen(evidence, "a");
+        if (output != NULL) {
+            fprintf(output, "%s\t%d\t%d\t%llu\n", weights->name,
+                    audit.requested, audit.loaded, (unsigned long long) audit.bytes);
+            fclose(output);
+        }
+    }
+    return audit;
+}
+
+static void kiln_stream_release(char (*slots)[CACHE_LINE_SIZE], int n_as) {
+    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+        void * data = kiln_stream_get_slot(slots, cur_a);
+        free(data);
+        kiln_stream_set_slot(slots, cur_a, NULL);
+    }
+}
+#else
+static bool kiln_moe_external_configured(void) { return false; }
+#endif
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1777,9 +1948,19 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
-        // Read-only page hint for only authoritative selected experts.
-        // No work for non-MoE graphs or when explicitly disabled.
-        kiln_advise_selected_moe_experts(src0, matrix_row_counts);
+        // Actual selected expert slabs are fetched from an external verified
+        // sidecar before thread workers start their MMID computation.
+        // Other ops and normal inference still use src0->data unchanged.
+#if defined(__linux__)
+        if (kiln_moe_external_configured()) {
+            (void) kiln_stream_selected(src0, matrix_row_counts, atomic_current_chunk);
+        }
+#endif
+        // Existing advisory page hint is useful only when not using the
+        // explicit external expert slab path.
+        if (!kiln_moe_external_configured()) {
+            kiln_advise_selected_moe_experts(src0, matrix_row_counts);
+        }
     }
 
     // reset current_chunk
@@ -1797,12 +1978,22 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        const char * external_expert = NULL;
+#if defined(__linux__)
+        if (kiln_moe_external_configured()) {
+            external_expert = (const char *) kiln_stream_get_slot(atomic_current_chunk, cur_a);
+        }
+#endif
+        // The tiled path reads original tensor memory directly. Only use it
+        // when this expert was NOT fetched from the external sidecar.
+        if (external_expert == NULL &&
+                ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1,
+                    (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = external_expert != NULL ? external_expert :
+            (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1855,6 +2046,18 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+
+#if defined(__linux__)
+    if (kiln_moe_external_configured()) {
+        // No worker can retain a slab pointer after this barrier. Releasing
+        // on ith=0 before the barrier would cause a real use-after-free.
+        ggml_barrier(params->threadpool);
+        if (ith == 0) {
+            kiln_stream_release(atomic_current_chunk, n_as);
+        }
+        ggml_barrier(params->threadpool);
+    }
+#endif
 }
 
 /////////////////////////////////
