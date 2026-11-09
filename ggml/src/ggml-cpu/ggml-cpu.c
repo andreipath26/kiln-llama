@@ -1604,13 +1604,21 @@ static void kiln_advise_selected_moe_experts(
 struct kiln_stream_audit {
     int requested;
     int loaded;
-    uint64_t bytes;
+    uint64_t bytes;          // bytes actually delivered to the CPU dot product
+    uint64_t pread_bytes;    // bytes fetched via explicit pread, not page-cache misses
+    int hot_cache_hits;
 };
 
 static bool kiln_moe_external_configured(void) {
     const char * blob = getenv("KILN_MOE_STREAM_BLOB");
     const char * index = getenv("KILN_MOE_STREAM_INDEX");
     return blob != NULL && blob[0] != '\0' && index != NULL && index[0] != '\0';
+}
+
+// Optional parallel selected-expert reads across existing CPU worker threads.
+static bool kiln_stream_parallel_requested(void) {
+    const char * value = getenv("KILN_MOE_STREAM_PARALLEL");
+    return value != NULL && value[0] == '1' && value[1] == '\0';
 }
 
 static void kiln_stream_set_slot(char (*slots)[CACHE_LINE_SIZE], int id, void * pointer) {
@@ -1623,6 +1631,323 @@ static void * kiln_stream_get_slot(char (*slots)[CACHE_LINE_SIZE], int id) {
     void * ptr = NULL;
     memcpy(&ptr, slots[id] + 16, sizeof(ptr));
     return ptr;
+}
+
+// Process-local, byte-bounded LRU for immutable external GGUF expert slabs.
+// Keyed by the actual file identity and byte range, not just a tensor name.
+// In-use entries are pinned until the full MMID threadpool barrier completes.
+// Disabled automatically when expert streaming is not explicitly enabled.
+struct kiln_cached_moe_slab {
+    dev_t device;
+    ino_t inode;
+    off_t file_size;
+    time_t mtime;
+    long mtime_nsec;
+    uint64_t offset;
+    size_t size;
+    unsigned int references;
+    uint64_t touched;
+    void * data;
+    struct kiln_cached_moe_slab * next;
+};
+
+static atomic_flag kiln_cache_lock_flag = ATOMIC_FLAG_INIT;
+static struct kiln_cached_moe_slab * kiln_cache_head = NULL;
+static size_t kiln_cache_bytes = 0;
+static uint64_t kiln_cache_clock = 0;
+
+static void kiln_cache_lock(void) {
+    while (atomic_flag_test_and_set_explicit(
+            &kiln_cache_lock_flag, memory_order_acquire)) {
+        sched_yield();
+    }
+}
+
+static void kiln_cache_unlock(void) {
+    atomic_flag_clear_explicit(&kiln_cache_lock_flag, memory_order_release);
+}
+
+static size_t kiln_cache_budget(void) {
+    const char * value = getenv("KILN_MOE_STREAM_CACHE_MIB");
+    if (value == NULL || value[0] == '\0') {
+        return 64u * 1024u * 1024u;
+    }
+    if (value[0] == '-') {
+        return 0;
+    }
+    errno = 0;
+    char * end = NULL;
+    unsigned long long mib = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || mib > 512u) {
+        return 0; // invalid configuration never allocates unbounded cache
+    }
+    return (size_t) mib * (1024u * 1024u);
+}
+
+static bool kiln_cache_identity_matches(
+        const struct kiln_cached_moe_slab * entry,
+        const struct stat * metadata, uint64_t offset, size_t bytes) {
+    return entry->device == metadata->st_dev &&
+           entry->inode == metadata->st_ino &&
+           entry->file_size == metadata->st_size &&
+           entry->mtime == metadata->st_mtime &&
+           entry->mtime_nsec == metadata->st_mtim.tv_nsec &&
+           entry->offset == offset &&
+           entry->size == bytes;
+}
+
+static void * kiln_cache_lookup(
+        const struct stat * metadata, uint64_t offset, size_t bytes) {
+    // An explicit zero-cache configuration must never reuse resident slabs
+    // even when a different model context populated the process-wide cache.
+    if (kiln_cache_budget() == 0) {
+        return NULL;
+    }
+    kiln_cache_lock();
+    for (struct kiln_cached_moe_slab * p = kiln_cache_head; p != NULL; p = p->next) {
+        if (kiln_cache_identity_matches(p, metadata, offset, bytes)) {
+            p->references += 1;
+            p->touched = ++kiln_cache_clock;
+            void * found = p->data;
+            kiln_cache_unlock();
+            return found;
+        }
+    }
+    kiln_cache_unlock();
+    return NULL;
+}
+
+static void * kiln_cache_admit(
+        const struct stat * metadata, uint64_t offset, size_t bytes,
+        void * freshly_read) {
+    const size_t budget = kiln_cache_budget();
+    if (bytes > budget || budget == 0) {
+        return freshly_read; // caller releases transient allocation normally
+    }
+    kiln_cache_lock();
+    // A concurrent model context may have read and inserted the same range
+    // while this one was outside the lock doing pread.
+    for (struct kiln_cached_moe_slab * p = kiln_cache_head; p != NULL; p = p->next) {
+        if (kiln_cache_identity_matches(p, metadata, offset, bytes)) {
+            p->references += 1;
+            p->touched = ++kiln_cache_clock;
+            void * existing = p->data;
+            kiln_cache_unlock();
+            free(freshly_read);
+            return existing;
+        }
+    }
+    while (kiln_cache_bytes > budget - bytes) {
+        struct kiln_cached_moe_slab ** oldest_link = NULL;
+        struct kiln_cached_moe_slab ** current = &kiln_cache_head;
+        uint64_t oldest_touch = UINT64_MAX;
+        while (*current != NULL) {
+            if ((*current)->references == 0 && (*current)->touched < oldest_touch) {
+                oldest_touch = (*current)->touched;
+                oldest_link = current;
+            }
+            current = &(*current)->next;
+        }
+        if (oldest_link == NULL) {
+            kiln_cache_unlock();
+            return freshly_read; // every possible victim is pinned by inference
+        }
+        struct kiln_cached_moe_slab * victim = *oldest_link;
+        *oldest_link = victim->next;
+        kiln_cache_bytes -= victim->size;
+        free(victim->data);
+        free(victim);
+    }
+    struct kiln_cached_moe_slab * entry = malloc(sizeof(*entry));
+    if (entry == NULL) {
+        kiln_cache_unlock();
+        return freshly_read;
+    }
+    *entry = (struct kiln_cached_moe_slab) {
+        .device = metadata->st_dev,
+        .inode = metadata->st_ino,
+        .file_size = metadata->st_size,
+        .mtime = metadata->st_mtime,
+        .mtime_nsec = metadata->st_mtim.tv_nsec,
+        .offset = offset,
+        .size = bytes,
+        .references = 1,
+        .touched = ++kiln_cache_clock,
+        .data = freshly_read,
+        .next = kiln_cache_head,
+    };
+    kiln_cache_head = entry;
+    kiln_cache_bytes += bytes;
+    kiln_cache_unlock();
+    return freshly_read;
+}
+
+static void kiln_cache_release_or_free(void * data) {
+    if (data == NULL) { return; }
+    kiln_cache_lock();
+    for (struct kiln_cached_moe_slab * p = kiln_cache_head; p != NULL; p = p->next) {
+        if (p->data == data) {
+            GGML_ASSERT(p->references > 0);
+            p->references -= 1;
+            kiln_cache_unlock();
+            return;
+        }
+    }
+    kiln_cache_unlock();
+    free(data);
+}
+
+// Validated expert-offset index, parsed once per immutable index file. Real
+// 70B MoE graphs call MMID hundreds of times per token; reparsing tens of
+// thousands of TSV rows at every operator would defeat streaming throughput.
+// Recheck file identity on each lookup, but binary-search cached entries.
+struct kiln_moe_offset_entry {
+    char name[64];
+    unsigned int expert_id;
+    uint64_t offset;
+    uint64_t size;
+};
+static struct kiln_moe_offset_entry * kiln_offset_entries = NULL;
+static size_t kiln_offset_count = 0;
+static char * kiln_offset_path = NULL;
+static struct stat kiln_offset_metadata;
+static bool kiln_offset_valid = false;
+
+static int kiln_offset_compare(const void * left, const void * right) {
+    const struct kiln_moe_offset_entry * a = left;
+    const struct kiln_moe_offset_entry * b = right;
+    int name_order = strcmp(a->name, b->name);
+    if (name_order != 0) {
+        return name_order;
+    }
+    return (a->expert_id > b->expert_id) - (a->expert_id < b->expert_id);
+}
+
+static bool kiln_offset_same_metadata(const struct stat * a, const struct stat * b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+           a->st_size == b->st_size && a->st_mtime == b->st_mtime &&
+           a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
+}
+
+static bool kiln_offset_lookup(
+        const char * path, const char * name, unsigned int expert,
+        uint64_t * offset, uint64_t * length) {
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+            st.st_size <= 0 || st.st_size > 64 * 1024 * 1024) {
+        return false;
+    }
+    kiln_cache_lock();
+    const bool current = kiln_offset_valid && kiln_offset_path != NULL &&
+            strcmp(kiln_offset_path, path) == 0 &&
+            kiln_offset_same_metadata(&kiln_offset_metadata, &st);
+    if (!current) {
+        // Clear any stale lookup before loading. A malformed or replaced
+        // index can never accidentally reuse previous model offsets.
+        free(kiln_offset_entries);
+        kiln_offset_entries = NULL;
+        kiln_offset_count = 0;
+        free(kiln_offset_path);
+        kiln_offset_path = NULL;
+        kiln_offset_valid = false;
+
+        FILE * file = fopen(path, "rb");
+        if (file != NULL) {
+            struct stat opened;
+            char header[128];
+            if (fstat(fileno(file), &opened) == 0 &&
+                    kiln_offset_same_metadata(&st, &opened) &&
+                    fgets(header, sizeof(header), file) != NULL &&
+                    strcmp(header, "KILN-MOE-STREAM-1\n") == 0) {
+                const size_t max_entries = 300000;
+                size_t capacity = 1024;
+                size_t count = 0;
+                struct kiln_moe_offset_entry * entries =
+                    malloc(capacity * sizeof(*entries));
+                bool good = entries != NULL;
+                char line[256];
+                while (good && fgets(line, sizeof(line), file) != NULL) {
+                    struct kiln_moe_offset_entry entry = {0};
+                    unsigned long long begin = 0;
+                    unsigned long long bytes = 0;
+                    char garbage;
+                    int parsed = sscanf(line, "%63[^\t]\t%u\t%llu\t%llu %c",
+                        entry.name, &entry.expert_id, &begin, &bytes, &garbage);
+                    if (parsed != 4 || bytes == 0 ||
+                            begin > UINT64_MAX - bytes ||
+                            strlen(line) == sizeof(line) - 1 && line[sizeof(line) - 2] != '\n') {
+                        good = false;
+                        break;
+                    }
+                    entry.offset = (uint64_t) begin;
+                    entry.size = (uint64_t) bytes;
+                    if (count >= max_entries) {
+                        good = false;
+                        break;
+                    }
+                    if (count == capacity) {
+                        size_t next = capacity * 2;
+                        if (next > max_entries) {
+                            next = max_entries;
+                        }
+                        void * resized = realloc(entries, next * sizeof(*entries));
+                        if (resized == NULL) {
+                            good = false;
+                            break;
+                        }
+                        entries = resized;
+                        capacity = next;
+                    }
+                    entries[count++] = entry;
+                }
+                if (ferror(file) != 0 || count == 0) {
+                    good = false;
+                }
+                if (good) {
+                    qsort(entries, count, sizeof(*entries), kiln_offset_compare);
+                    for (size_t i = 1; i < count; ++i) {
+                        if (kiln_offset_compare(&entries[i - 1], &entries[i]) == 0) {
+                            good = false; // never silently override duplicate source keys
+                            break;
+                        }
+                    }
+                }
+                if (good) {
+                    kiln_offset_path = strdup(path);
+                    if (kiln_offset_path != NULL) {
+                        kiln_offset_entries = entries;
+                        kiln_offset_count = count;
+                        kiln_offset_metadata = st;
+                        kiln_offset_valid = true;
+                    } else {
+                        free(entries);
+                    }
+                } else {
+                    free(entries);
+                }
+            }
+            fclose(file);
+        }
+    }
+    bool found = false;
+    if (kiln_offset_valid) {
+        struct kiln_moe_offset_entry key = {0};
+        size_t name_length = strlen(name);
+        if (name_length < sizeof(key.name)) {
+            memcpy(key.name, name, name_length);
+            key.expert_id = expert;
+            const struct kiln_moe_offset_entry * value = bsearch(&key,
+                kiln_offset_entries, kiln_offset_count,
+                sizeof(*kiln_offset_entries), kiln_offset_compare);
+            if (value != NULL) {
+                *offset = value->offset;
+                *length = value->size;
+                found = true;
+            }
+        }
+    }
+    kiln_cache_unlock();
+    return found;
 }
 
 static bool kiln_stream_read_all(int fd, void * destination, uint64_t offset, size_t bytes) {
@@ -1645,10 +1970,16 @@ static bool kiln_stream_read_all(int fd, void * destination, uint64_t offset, si
 static struct kiln_stream_audit kiln_stream_selected(
     const struct ggml_tensor * weights,
     const int64_t * selected_rows,
-    char (*slots)[CACHE_LINE_SIZE]) {
-    struct kiln_stream_audit audit = {0, 0, 0};
-    for (int64_t id = 0; id < weights->ne[2]; ++id) {
-        kiln_stream_set_slot(slots, (int) id, NULL);
+    char (*slots)[CACHE_LINE_SIZE],
+    int shard, int shards) {
+    struct kiln_stream_audit audit = {0, 0, 0, 0, 0};
+    if (weights->ne[2] <= 0 || weights->ne[2] > INT32_MAX ||
+            shards <= 0 || shard < 0 || shard >= shards) {
+        return audit;
+    }
+    // Each CPU worker owns only its assigned actual selected expert IDs.
+    // Slots have already been zeroed by ith=0 before the routing barrier.
+    for (int64_t id = shard; id < weights->ne[2]; id += shards) {
         if (selected_rows[id] != 0) {
             audit.requested++;
         }
@@ -1673,76 +2004,69 @@ static struct kiln_stream_audit kiln_stream_selected(
         return audit;
     }
     // Bounded temporary allocations: this is a Tier-0 safety constraint.
-    const size_t max_bytes = 256u * 1024u * 1024u;
+    // Bound ALL CPU worker allocations, not only each thread in isolation.
+    const size_t max_bytes = (256u * 1024u * 1024u) / (size_t) shards;
     if (expert_bytes > max_bytes) {
         return audit;
     }
     const char * index_file = getenv("KILN_MOE_STREAM_INDEX");
     const char * blob_file = getenv("KILN_MOE_STREAM_BLOB");
-    FILE * index = fopen(index_file, "rb");
-    if (index == NULL) { return audit; }
-    char header[128];
-    if (fgets(header, sizeof(header), index) == NULL ||
-            strcmp(header, "KILN-MOE-STREAM-1\n") != 0) {
-        fclose(index);
-        return audit;
-    }
     int fd = open(blob_file, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        fclose(index);
-        return audit;
-    }
+    if (fd < 0) { return audit; }
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
         close(fd);
-        fclose(index);
         return audit;
     }
     const uint64_t blob_size = (uint64_t) st.st_size;
-    char line[256];
     size_t allocated = 0;
-    // Parsing is bounded by file size and per-op byte allowance. Longer or
-    // malformed lines are skipped; no tensor name or path becomes executable.
-    while (fgets(line, sizeof(line), index) != NULL) {
-        char name[64] = {0};
-        unsigned int id = 0;
-        unsigned long long offset = 0;
-        unsigned long long length = 0;
-        char extra;
-        const int count = sscanf(line, "%63[^\t]\t%u\t%llu\t%llu %c",
-                                 name, &id, &offset, &length, &extra);
-        if (count != 4 || strcmp(name, weights->name) != 0 ||
-                id >= (unsigned int) weights->ne[2] ||
-                selected_rows[id] == 0 || kiln_stream_get_slot(slots, (int) id) != NULL) {
+    for (int64_t selected_id = 0; selected_id < weights->ne[2]; ++selected_id) {
+        const unsigned int id = (unsigned int) selected_id;
+        if (selected_rows[id] == 0 ||
+                (int) (id % (unsigned int) shards) != shard ||
+                kiln_stream_get_slot(slots, (int) id) != NULL) {
             continue;
         }
-        if (length != (unsigned long long) expert_bytes ||
+        uint64_t offset = 0;
+        uint64_t length = 0;
+        if (!kiln_offset_lookup(index_file, weights->name, id, &offset, &length)) {
+            continue;
+        }
+        if (length != (uint64_t) expert_bytes ||
                 offset > blob_size || length > blob_size - offset ||
                 offset > (uint64_t) INT64_MAX - length ||
                 expert_bytes > max_bytes - allocated) {
             continue;
         }
-        void * data = NULL;
-        if (posix_memalign(&data, 64, expert_bytes) != 0 || data == NULL) {
-            continue;
-        }
-        if (!kiln_stream_read_all(fd, data, (uint64_t) offset, expert_bytes)) {
-            free(data);
-            continue;
+        void * data = kiln_cache_lookup(&st, offset, expert_bytes);
+        bool pread_needed = data == NULL;
+        if (pread_needed) {
+            if (posix_memalign(&data, 64, expert_bytes) != 0 || data == NULL) {
+                continue;
+            }
+            if (!kiln_stream_read_all(fd, data, offset, expert_bytes)) {
+                free(data);
+                continue;
+            }
+            audit.pread_bytes += expert_bytes;
+            data = kiln_cache_admit(&st, offset, expert_bytes, data);
+        } else {
+            audit.hot_cache_hits++;
         }
         kiln_stream_set_slot(slots, (int) id, data);
         audit.loaded++;
         audit.bytes += expert_bytes;
         allocated += expert_bytes;
     }
-    fclose(index);
     close(fd);
     const char * evidence = getenv("KILN_MOE_STREAM_AUDIT");
     if (evidence != NULL && evidence[0] != '\0') {
         FILE * output = fopen(evidence, "a");
         if (output != NULL) {
-            fprintf(output, "%s\t%d\t%d\t%llu\n", weights->name,
-                    audit.requested, audit.loaded, (unsigned long long) audit.bytes);
+            fprintf(output, "%s\t%d\t%d\t%llu\t%llu\t%d\n", weights->name,
+                    audit.requested, audit.loaded,
+                    (unsigned long long) audit.bytes,
+                    (unsigned long long) audit.pread_bytes, audit.hot_cache_hits);
             fclose(output);
         }
     }
@@ -1752,7 +2076,7 @@ static struct kiln_stream_audit kiln_stream_selected(
 static void kiln_stream_release(char (*slots)[CACHE_LINE_SIZE], int n_as) {
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         void * data = kiln_stream_get_slot(slots, cur_a);
-        free(data);
+        kiln_cache_release_or_free(data);
         kiln_stream_set_slot(slots, cur_a, NULL);
     }
 }
@@ -1948,20 +2272,34 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
-        // Actual selected expert slabs are fetched from an external verified
-        // sidecar before thread workers start their MMID computation.
-        // Other ops and normal inference still use src0->data unchanged.
+        // Only router thread initializes the expert pointer slots. Their
+        // bytes are separate from the existing atomic work counters.
 #if defined(__linux__)
         if (kiln_moe_external_configured()) {
-            (void) kiln_stream_selected(src0, matrix_row_counts, atomic_current_chunk);
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                kiln_stream_set_slot(atomic_current_chunk, cur_a, NULL);
+            }
         }
 #endif
-        // Existing advisory page hint is useful only when not using the
-        // explicit external expert slab path.
         if (!kiln_moe_external_configured()) {
             kiln_advise_selected_moe_experts(src0, matrix_row_counts);
         }
     }
+
+#if defined(__linux__)
+    if (kiln_moe_external_configured()) {
+        // Publish exact model router rows and empty slots before I/O.
+        // All existing worker threads join; no new pthreads are created.
+        ggml_barrier(params->threadpool);
+        const bool parallel = kiln_stream_parallel_requested() && nth > 1;
+        if (parallel || ith == 0) {
+            (void) kiln_stream_selected(src0, matrix_row_counts,
+                atomic_current_chunk, parallel ? ith : 0, parallel ? nth : 1);
+        }
+        // Existing pre-matmul barrier below waits for every worker's
+        // pread and publishes slab pointers before computation begins.
+    }
+#endif
 
     // reset current_chunk
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
