@@ -1471,6 +1471,59 @@ UseGgmlGemm2:;
     }
 }
 
+// KILN Phase 5A: opt-in, read-only capture of the actual CPU MoE route.
+ // A trace records (layer, expert, local batch row, weight tensor name).
+ // Multiple MAT_ID projections may report the same route; consumers must
+ // deduplicate projection repeats before treating these as token/layer sets.
+ // Capture is disabled unless KILN_MOE_ROUTER_TRACE specifies a file path.
+ // This is for feasibility experiments, never an active streaming backend.
+static void kiln_trace_moe_router_ids(
+        const struct ggml_tensor * weights,
+        const struct ggml_tensor * ids) {
+    const char * path = getenv("KILN_MOE_ROUTER_TRACE");
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+
+    unsigned int layer = 0;
+    // The standard GGUF graph naming convention identifies a transformer
+    // block. Unsupported tensor names are ignored rather than guessed.
+    if (sscanf(weights->name, "blk.%u.", &layer) != 1) {
+        return;
+    }
+
+    // Keep trace size finite even for long-running local inference servers.
+    static atomic_int entries = 0;
+    static atomic_flag lock = ATOMIC_FLAG_INIT;
+    if (atomic_load(&entries) >= 1000000) {
+        return;
+    }
+    while (atomic_flag_test_and_set(&lock)) {
+        sched_yield();
+    }
+
+    FILE * output = fopen(path, "a");
+    if (output != NULL) {
+        for (int64_t row = 0; row < ids->ne[1]; ++row) {
+            for (int64_t selected = 0; selected < ids->ne[0]; ++selected) {
+                if (atomic_load(&entries) >= 1000000) {
+                    break;
+                }
+                int32_t expert = *(const int32_t *) ((const char *) ids->data +
+                    row * ids->nb[1] + selected * ids->nb[0]);
+                if (expert < 0) {
+                    continue;
+                }
+                fprintf(output, "%u\t%d\t%lld\t%s\n",
+                    layer, expert, (long long) row, weights->name);
+                atomic_fetch_add(&entries, 1);
+            }
+        }
+        fclose(output);
+    }
+    atomic_flag_clear(&lock);
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1644,6 +1697,7 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        kiln_trace_moe_router_ids(src0, ids);
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
