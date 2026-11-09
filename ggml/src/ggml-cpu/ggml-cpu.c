@@ -1636,6 +1636,7 @@ struct kiln_cached_moe_slab {
     ino_t inode;
     off_t file_size;
     time_t mtime;
+    long mtime_nsec;
     uint64_t offset;
     size_t size;
     unsigned int references;
@@ -1684,6 +1685,7 @@ static bool kiln_cache_identity_matches(
            entry->inode == metadata->st_ino &&
            entry->file_size == metadata->st_size &&
            entry->mtime == metadata->st_mtime &&
+           entry->mtime_nsec == metadata->st_mtim.tv_nsec &&
            entry->offset == offset &&
            entry->size == bytes;
 }
@@ -1755,6 +1757,7 @@ static void * kiln_cache_admit(
         .inode = metadata->st_ino,
         .file_size = metadata->st_size,
         .mtime = metadata->st_mtime,
+        .mtime_nsec = metadata->st_mtim.tv_nsec,
         .offset = offset,
         .size = bytes,
         .references = 1,
