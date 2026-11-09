@@ -1663,7 +1663,7 @@ static struct kiln_stream_audit kiln_stream_selected(
     }
 
     const size_t row_bytes = ggml_row_size(weights->type, weights->ne[0]);
-    if (row_bytes == 0 || weights->ne[1] > (int64_t) (SIZE_MAX / row_bytes)) {
+    if (row_bytes == 0 || (uint64_t) weights->ne[1] > (uint64_t) (SIZE_MAX / row_bytes)) {
         return audit;
     }
     const size_t expert_bytes = row_bytes * (size_t) weights->ne[1];
