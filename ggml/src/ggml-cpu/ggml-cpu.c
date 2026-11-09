@@ -35,6 +35,9 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
@@ -1524,6 +1527,67 @@ static void kiln_trace_moe_router_ids(
     atomic_flag_clear(&lock);
 }
 
+// Opt-in, bounded CPU MoE page advice on ACTUAL graph-router selections.
+// No predictions, no weight copying and no residency guarantee. Only call
+// after authoritative MAT_ID IDs have been converted to the selected set.
+// Disabled in all normal inference unless KILN_MOE_WILLNEED=1.
+static void kiln_advise_selected_moe_experts(
+        const struct ggml_tensor * weights,
+        const int64_t * selected_rows) {
+#if defined(__linux__)
+    const char * enabled = getenv("KILN_MOE_WILLNEED");
+    if (enabled == NULL || enabled[0] != '1' || enabled[1] != '\0') {
+        return;
+    }
+    if (weights->data == NULL || weights->ne[0] <= 0 ||
+        weights->ne[1] <= 0 || weights->ne[2] <= 0) {
+        return;
+    }
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || (((unsigned long) page_size) &
+        ((unsigned long) page_size - 1)) != 0) {
+        return;
+    }
+    const size_t row_bytes = ggml_row_size(weights->type, weights->ne[0]);
+    if ((size_t) (weights->ne[1] - 1) > (SIZE_MAX - row_bytes) / weights->nb[1]) {
+        return;
+    }
+    const size_t expert_bytes = (size_t) (weights->ne[1] - 1) * weights->nb[1] + row_bytes;
+    if (expert_bytes == 0 || expert_bytes > weights->nb[2]) {
+        return; // unexpected or overlapping tensor layout
+    }
+    const size_t budget = 64u * 1024u * 1024u; // limit each operator's hint volume
+    size_t advised = 0;
+    for (int64_t expert = 0; expert < weights->ne[2]; ++expert) {
+        if (selected_rows[expert] == 0 || expert_bytes > budget - advised) {
+            continue;
+        }
+        if ((size_t) expert > (SIZE_MAX - (uintptr_t) weights->data) / weights->nb[2]) {
+            return;
+        }
+        const uintptr_t begin = (uintptr_t) weights->data + (size_t) expert * weights->nb[2];
+        const uintptr_t mask = (uintptr_t) page_size - 1;
+        if (begin > UINTPTR_MAX - expert_bytes - mask) {
+            return;
+        }
+        const uintptr_t aligned_begin = begin & ~mask;
+        const uintptr_t aligned_end = (begin + expert_bytes + mask) & ~mask;
+        if (aligned_end <= aligned_begin) {
+            return;
+        }
+        // Advisory only. EINVAL may mean anonymous/unmapped/unsupported
+        // storage; never replace real router computation with a hint.
+        if (madvise((void *) aligned_begin, (size_t) (aligned_end - aligned_begin),
+                MADV_WILLNEED) == 0) {
+            advised += expert_bytes;
+        }
+    }
+#else
+    (void) weights;
+    (void) selected_rows;
+#endif
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1712,6 +1776,9 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+        // Read-only page hint for only authoritative selected experts.
+        // No work for non-MoE graphs or when explicitly disabled.
+        kiln_advise_selected_moe_experts(src0, matrix_row_counts);
     }
 
     // reset current_chunk
