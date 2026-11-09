@@ -1540,7 +1540,8 @@ static void kiln_advise_selected_moe_experts(
         return;
     }
     if (weights->data == NULL || weights->ne[0] <= 0 ||
-        weights->ne[1] <= 0 || weights->ne[2] <= 0) {
+        weights->ne[1] <= 0 || weights->ne[2] <= 0 ||
+        weights->nb[1] == 0 || weights->nb[2] == 0) {
         return;
     }
     const long page_size = sysconf(_SC_PAGESIZE);
