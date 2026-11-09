@@ -1791,6 +1791,159 @@ static void kiln_cache_release_or_free(void * data) {
     free(data);
 }
 
+// Validated expert-offset index, parsed once per immutable index file. Real
+// 70B MoE graphs call MMID hundreds of times per token; reparsing tens of
+// thousands of TSV rows at every operator would defeat streaming throughput.
+// Recheck file identity on each lookup, but binary-search cached entries.
+struct kiln_moe_offset_entry {
+    char name[64];
+    unsigned int expert_id;
+    uint64_t offset;
+    uint64_t size;
+};
+static struct kiln_moe_offset_entry * kiln_offset_entries = NULL;
+static size_t kiln_offset_count = 0;
+static char * kiln_offset_path = NULL;
+static struct stat kiln_offset_metadata;
+static bool kiln_offset_valid = false;
+
+static int kiln_offset_compare(const void * left, const void * right) {
+    const struct kiln_moe_offset_entry * a = left;
+    const struct kiln_moe_offset_entry * b = right;
+    int name_order = strcmp(a->name, b->name);
+    if (name_order != 0) {
+        return name_order;
+    }
+    return (a->expert_id > b->expert_id) - (a->expert_id < b->expert_id);
+}
+
+static bool kiln_offset_same_metadata(const struct stat * a, const struct stat * b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+           a->st_size == b->st_size && a->st_mtime == b->st_mtime &&
+           a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
+}
+
+static bool kiln_offset_lookup(
+        const char * path, const char * name, unsigned int expert,
+        uint64_t * offset, uint64_t * length) {
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+            st.st_size <= 0 || st.st_size > 64 * 1024 * 1024) {
+        return false;
+    }
+    kiln_cache_lock();
+    const bool current = kiln_offset_valid && kiln_offset_path != NULL &&
+            strcmp(kiln_offset_path, path) == 0 &&
+            kiln_offset_same_metadata(&kiln_offset_metadata, &st);
+    if (!current) {
+        // Clear any stale lookup before loading. A malformed or replaced
+        // index can never accidentally reuse previous model offsets.
+        free(kiln_offset_entries);
+        kiln_offset_entries = NULL;
+        kiln_offset_count = 0;
+        free(kiln_offset_path);
+        kiln_offset_path = NULL;
+        kiln_offset_valid = false;
+
+        FILE * file = fopen(path, "rb");
+        if (file != NULL) {
+            struct stat opened;
+            char header[128];
+            if (fstat(fileno(file), &opened) == 0 &&
+                    kiln_offset_same_metadata(&st, &opened) &&
+                    fgets(header, sizeof(header), file) != NULL &&
+                    strcmp(header, "KILN-MOE-STREAM-1\n") == 0) {
+                const size_t max_entries = 300000;
+                size_t capacity = 1024;
+                size_t count = 0;
+                struct kiln_moe_offset_entry * entries =
+                    malloc(capacity * sizeof(*entries));
+                bool good = entries != NULL;
+                char line[256];
+                while (good && fgets(line, sizeof(line), file) != NULL) {
+                    struct kiln_moe_offset_entry entry = {0};
+                    unsigned long long begin = 0;
+                    unsigned long long bytes = 0;
+                    char garbage;
+                    int parsed = sscanf(line, "%63[^\t]\t%u\t%llu\t%llu %c",
+                        entry.name, &entry.expert_id, &begin, &bytes, &garbage);
+                    if (parsed != 4 || bytes == 0 ||
+                            begin > UINT64_MAX - bytes ||
+                            strlen(line) == sizeof(line) - 1 && line[sizeof(line) - 2] != '\n') {
+                        good = false;
+                        break;
+                    }
+                    entry.offset = (uint64_t) begin;
+                    entry.size = (uint64_t) bytes;
+                    if (count >= max_entries) {
+                        good = false;
+                        break;
+                    }
+                    if (count == capacity) {
+                        size_t next = capacity * 2;
+                        if (next > max_entries) {
+                            next = max_entries;
+                        }
+                        void * resized = realloc(entries, next * sizeof(*entries));
+                        if (resized == NULL) {
+                            good = false;
+                            break;
+                        }
+                        entries = resized;
+                        capacity = next;
+                    }
+                    entries[count++] = entry;
+                }
+                if (ferror(file) != 0 || count == 0) {
+                    good = false;
+                }
+                if (good) {
+                    qsort(entries, count, sizeof(*entries), kiln_offset_compare);
+                    for (size_t i = 1; i < count; ++i) {
+                        if (kiln_offset_compare(&entries[i - 1], &entries[i]) == 0) {
+                            good = false; // never silently override duplicate source keys
+                            break;
+                        }
+                    }
+                }
+                if (good) {
+                    kiln_offset_path = strdup(path);
+                    if (kiln_offset_path != NULL) {
+                        kiln_offset_entries = entries;
+                        kiln_offset_count = count;
+                        kiln_offset_metadata = st;
+                        kiln_offset_valid = true;
+                    } else {
+                        free(entries);
+                    }
+                } else {
+                    free(entries);
+                }
+            }
+            fclose(file);
+        }
+    }
+    bool found = false;
+    if (kiln_offset_valid) {
+        struct kiln_moe_offset_entry key = {0};
+        size_t name_length = strlen(name);
+        if (name_length < sizeof(key.name)) {
+            memcpy(key.name, name, name_length);
+            key.expert_id = expert;
+            const struct kiln_moe_offset_entry * value = bsearch(&key,
+                kiln_offset_entries, kiln_offset_count,
+                sizeof(*kiln_offset_entries), kiln_offset_compare);
+            if (value != NULL) {
+                *offset = value->offset;
+                *length = value->size;
+                found = true;
+            }
+        }
+    }
+    kiln_cache_unlock();
+    return found;
+}
+
 static bool kiln_stream_read_all(int fd, void * destination, uint64_t offset, size_t bytes) {
     unsigned char * dst = (unsigned char *) destination;
     size_t cursor = 0;
@@ -1848,79 +2001,51 @@ static struct kiln_stream_audit kiln_stream_selected(
     }
     const char * index_file = getenv("KILN_MOE_STREAM_INDEX");
     const char * blob_file = getenv("KILN_MOE_STREAM_BLOB");
-    FILE * index = fopen(index_file, "rb");
-    if (index == NULL) { return audit; }
-    struct stat index_metadata;
-    if (fstat(fileno(index), &index_metadata) != 0 ||
-            !S_ISREG(index_metadata.st_mode) ||
-            index_metadata.st_size <= 0 ||
-            index_metadata.st_size > 64 * 1024 * 1024) {
-        fclose(index);
-        return audit; // ignore non-regular and overlarge untrusted index files
-    }
-    char header[128];
-    if (fgets(header, sizeof(header), index) == NULL ||
-            strcmp(header, "KILN-MOE-STREAM-1\n") != 0) {
-        fclose(index);
-        return audit;
-    }
     int fd = open(blob_file, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        fclose(index);
-        return audit;
-    }
+    if (fd < 0) { return audit; }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
         close(fd);
-        fclose(index);
         return audit;
     }
     const uint64_t blob_size = (uint64_t) st.st_size;
-    char line[256];
     size_t allocated = 0;
-    // Parsing is bounded by file size and per-op byte allowance. Longer or
-    // malformed lines are skipped; no tensor name or path becomes executable.
-    while (fgets(line, sizeof(line), index) != NULL) {
-        char name[64] = {0};
-        unsigned int id = 0;
-        unsigned long long offset = 0;
-        unsigned long long length = 0;
-        char extra;
-        const int count = sscanf(line, "%63[^\t]\t%u\t%llu\t%llu %c",
-                                 name, &id, &offset, &length, &extra);
-        if (count != 4 || strcmp(name, weights->name) != 0 ||
-                id >= (unsigned int) weights->ne[2] ||
-                selected_rows[id] == 0 || kiln_stream_get_slot(slots, (int) id) != NULL) {
+    for (int64_t selected_id = 0; selected_id < weights->ne[2]; ++selected_id) {
+        const unsigned int id = (unsigned int) selected_id;
+        if (selected_rows[id] == 0 || kiln_stream_get_slot(slots, (int) id) != NULL) {
             continue;
         }
-        if (length != (unsigned long long) expert_bytes ||
+        uint64_t offset = 0;
+        uint64_t length = 0;
+        if (!kiln_offset_lookup(index_file, weights->name, id, &offset, &length)) {
+            continue;
+        }
+        if (length != (uint64_t) expert_bytes ||
                 offset > blob_size || length > blob_size - offset ||
                 offset > (uint64_t) INT64_MAX - length ||
                 expert_bytes > max_bytes - allocated) {
             continue;
         }
-        void * data = kiln_cache_lookup(&st, (uint64_t) offset, expert_bytes);
+        void * data = kiln_cache_lookup(&st, offset, expert_bytes);
         bool pread_needed = data == NULL;
         if (pread_needed) {
             if (posix_memalign(&data, 64, expert_bytes) != 0 || data == NULL) {
                 continue;
             }
-            if (!kiln_stream_read_all(fd, data, (uint64_t) offset, expert_bytes)) {
+            if (!kiln_stream_read_all(fd, data, offset, expert_bytes)) {
                 free(data);
                 continue;
             }
             audit.pread_bytes += expert_bytes;
-            data = kiln_cache_admit(&st, (uint64_t) offset, expert_bytes, data);
+            data = kiln_cache_admit(&st, offset, expert_bytes, data);
         } else {
             audit.hot_cache_hits++;
         }
         kiln_stream_set_slot(slots, (int) id, data);
         audit.loaded++;
-        // Bytes made available for the real CPU dot product, including cache.
         audit.bytes += expert_bytes;
         allocated += expert_bytes;
     }
-    fclose(index);
     close(fd);
     const char * evidence = getenv("KILN_MOE_STREAM_AUDIT");
     if (evidence != NULL && evidence[0] != '\0') {
