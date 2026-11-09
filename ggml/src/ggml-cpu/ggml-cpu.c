@@ -1692,6 +1692,11 @@ static bool kiln_cache_identity_matches(
 
 static void * kiln_cache_lookup(
         const struct stat * metadata, uint64_t offset, size_t bytes) {
+    // An explicit zero-cache configuration must never reuse resident slabs
+    // even when a different model context populated the process-wide cache.
+    if (kiln_cache_budget() == 0) {
+        return NULL;
+    }
     kiln_cache_lock();
     for (struct kiln_cached_moe_slab * p = kiln_cache_head; p != NULL; p = p->next) {
         if (kiln_cache_identity_matches(p, metadata, offset, bytes)) {
@@ -1845,6 +1850,14 @@ static struct kiln_stream_audit kiln_stream_selected(
     const char * blob_file = getenv("KILN_MOE_STREAM_BLOB");
     FILE * index = fopen(index_file, "rb");
     if (index == NULL) { return audit; }
+    struct stat index_metadata;
+    if (fstat(fileno(index), &index_metadata) != 0 ||
+            !S_ISREG(index_metadata.st_mode) ||
+            index_metadata.st_size <= 0 ||
+            index_metadata.st_size > 64 * 1024 * 1024) {
+        fclose(index);
+        return audit; // ignore non-regular and overlarge untrusted index files
+    }
     char header[128];
     if (fgets(header, sizeof(header), index) == NULL ||
             strcmp(header, "KILN-MOE-STREAM-1\n") != 0) {
@@ -1857,7 +1870,7 @@ static struct kiln_stream_audit kiln_stream_selected(
         return audit;
     }
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
         close(fd);
         fclose(index);
         return audit;
