@@ -1604,7 +1604,9 @@ static void kiln_advise_selected_moe_experts(
 struct kiln_stream_audit {
     int requested;
     int loaded;
-    uint64_t bytes;
+    uint64_t bytes;          // bytes actually delivered to the CPU dot product
+    uint64_t pread_bytes;    // bytes fetched via explicit pread, not page-cache misses
+    int hot_cache_hits;
 };
 
 static bool kiln_moe_external_configured(void) {
@@ -1802,7 +1804,7 @@ static struct kiln_stream_audit kiln_stream_selected(
     const struct ggml_tensor * weights,
     const int64_t * selected_rows,
     char (*slots)[CACHE_LINE_SIZE]) {
-    struct kiln_stream_audit audit = {0, 0, 0};
+    struct kiln_stream_audit audit = {0, 0, 0, 0, 0};
     if (weights->ne[2] <= 0 || weights->ne[2] > INT32_MAX) {
         return audit;
     }
@@ -1891,7 +1893,10 @@ static struct kiln_stream_audit kiln_stream_selected(
                 free(data);
                 continue;
             }
+            audit.pread_bytes += expert_bytes;
             data = kiln_cache_admit(&st, (uint64_t) offset, expert_bytes, data);
+        } else {
+            audit.hot_cache_hits++;
         }
         kiln_stream_set_slot(slots, (int) id, data);
         audit.loaded++;
@@ -1905,8 +1910,10 @@ static struct kiln_stream_audit kiln_stream_selected(
     if (evidence != NULL && evidence[0] != '\0') {
         FILE * output = fopen(evidence, "a");
         if (output != NULL) {
-            fprintf(output, "%s\t%d\t%d\t%llu\n", weights->name,
-                    audit.requested, audit.loaded, (unsigned long long) audit.bytes);
+            fprintf(output, "%s\t%d\t%d\t%llu\t%llu\t%d\n", weights->name,
+                    audit.requested, audit.loaded,
+                    (unsigned long long) audit.bytes,
+                    (unsigned long long) audit.pread_bytes, audit.hot_cache_hits);
             fclose(output);
         }
     }
