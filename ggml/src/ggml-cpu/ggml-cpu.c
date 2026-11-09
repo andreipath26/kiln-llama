@@ -1615,6 +1615,12 @@ static bool kiln_moe_external_configured(void) {
     return blob != NULL && blob[0] != '\0' && index != NULL && index[0] != '\0';
 }
 
+// Optional parallel selected-expert reads across existing CPU worker threads.
+static bool kiln_stream_parallel_requested(void) {
+    const char * value = getenv("KILN_MOE_STREAM_PARALLEL");
+    return value != NULL && value[0] == '1' && value[1] == '\0';
+}
+
 static void kiln_stream_set_slot(char (*slots)[CACHE_LINE_SIZE], int id, void * pointer) {
     // The first cacheline word belongs to the existing atomic work counter.
     // The second word is reserved for the selected external slab pointer.
@@ -1964,13 +1970,16 @@ static bool kiln_stream_read_all(int fd, void * destination, uint64_t offset, si
 static struct kiln_stream_audit kiln_stream_selected(
     const struct ggml_tensor * weights,
     const int64_t * selected_rows,
-    char (*slots)[CACHE_LINE_SIZE]) {
+    char (*slots)[CACHE_LINE_SIZE],
+    int shard, int shards) {
     struct kiln_stream_audit audit = {0, 0, 0, 0, 0};
-    if (weights->ne[2] <= 0 || weights->ne[2] > INT32_MAX) {
+    if (weights->ne[2] <= 0 || weights->ne[2] > INT32_MAX ||
+            shards <= 0 || shard < 0 || shard >= shards) {
         return audit;
     }
-    for (int64_t id = 0; id < weights->ne[2]; ++id) {
-        kiln_stream_set_slot(slots, (int) id, NULL);
+    // Each CPU worker owns only its assigned actual selected expert IDs.
+    // Slots have already been zeroed by ith=0 before the routing barrier.
+    for (int64_t id = shard; id < weights->ne[2]; id += shards) {
         if (selected_rows[id] != 0) {
             audit.requested++;
         }
@@ -1995,7 +2004,8 @@ static struct kiln_stream_audit kiln_stream_selected(
         return audit;
     }
     // Bounded temporary allocations: this is a Tier-0 safety constraint.
-    const size_t max_bytes = 256u * 1024u * 1024u;
+    // Bound ALL CPU worker allocations, not only each thread in isolation.
+    const size_t max_bytes = (256u * 1024u * 1024u) / (size_t) shards;
     if (expert_bytes > max_bytes) {
         return audit;
     }
@@ -2012,7 +2022,9 @@ static struct kiln_stream_audit kiln_stream_selected(
     size_t allocated = 0;
     for (int64_t selected_id = 0; selected_id < weights->ne[2]; ++selected_id) {
         const unsigned int id = (unsigned int) selected_id;
-        if (selected_rows[id] == 0 || kiln_stream_get_slot(slots, (int) id) != NULL) {
+        if (selected_rows[id] == 0 ||
+                (int) (id % (unsigned int) shards) != shard ||
+                kiln_stream_get_slot(slots, (int) id) != NULL) {
             continue;
         }
         uint64_t offset = 0;
@@ -2260,20 +2272,34 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
-        // Actual selected expert slabs are fetched from an external verified
-        // sidecar before thread workers start their MMID computation.
-        // Other ops and normal inference still use src0->data unchanged.
+        // Only router thread initializes the expert pointer slots. Their
+        // bytes are separate from the existing atomic work counters.
 #if defined(__linux__)
         if (kiln_moe_external_configured()) {
-            (void) kiln_stream_selected(src0, matrix_row_counts, atomic_current_chunk);
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                kiln_stream_set_slot(atomic_current_chunk, cur_a, NULL);
+            }
         }
 #endif
-        // Existing advisory page hint is useful only when not using the
-        // explicit external expert slab path.
         if (!kiln_moe_external_configured()) {
             kiln_advise_selected_moe_experts(src0, matrix_row_counts);
         }
     }
+
+#if defined(__linux__)
+    if (kiln_moe_external_configured()) {
+        // Publish exact model router rows and empty slots before I/O.
+        // All existing worker threads join; no new pthreads are created.
+        ggml_barrier(params->threadpool);
+        const bool parallel = kiln_stream_parallel_requested() && nth > 1;
+        if (parallel || ith == 0) {
+            (void) kiln_stream_selected(src0, matrix_row_counts,
+                atomic_current_chunk, parallel ? ith : 0, parallel ? nth : 1);
+        }
+        // Existing pre-matmul barrier below waits for every worker's
+        // pread and publishes slab pointers before computation begins.
+    }
+#endif
 
     // reset current_chunk
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
