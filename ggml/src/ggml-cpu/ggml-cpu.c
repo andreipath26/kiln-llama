@@ -1804,6 +1804,7 @@ static void kiln_cache_release_or_free(void * data) {
 struct kiln_moe_offset_entry {
     char name[64];
     unsigned int expert_id;
+    unsigned int source_id; // v1 implicit source 0; v2 explicit shard
     uint64_t offset;
     uint64_t size;
 };
@@ -1812,6 +1813,13 @@ static size_t kiln_offset_count = 0;
 static char * kiln_offset_path = NULL;
 static struct stat kiln_offset_metadata;
 static bool kiln_offset_valid = false;
+// KILN-MOE-STREAM-2 pins each indexed slab to one original GGUF shard.
+// Source paths are parsed with the same validated index under the cache lock.
+// This table is bounded independently from the number of expert entries.
+#define KILN_MOE_MAX_SOURCES 64
+static bool kiln_offset_multi_source = false;
+static unsigned int kiln_offset_source_count = 0;
+static char kiln_offset_sources[KILN_MOE_MAX_SOURCES][PATH_MAX];
 
 static int kiln_offset_compare(const void * left, const void * right) {
     const struct kiln_moe_offset_entry * a = left;
@@ -1831,7 +1839,8 @@ static bool kiln_offset_same_metadata(const struct stat * a, const struct stat *
 
 static bool kiln_offset_lookup(
         const char * path, const char * name, unsigned int expert,
-        uint64_t * offset, uint64_t * length) {
+        uint64_t * offset, uint64_t * length,
+        unsigned int * source_id, char * source_path, size_t source_path_capacity) {
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
             st.st_size <= 0 || st.st_size > 64 * 1024 * 1024) {
@@ -1850,6 +1859,9 @@ static bool kiln_offset_lookup(
         free(kiln_offset_path);
         kiln_offset_path = NULL;
         kiln_offset_valid = false;
+        kiln_offset_multi_source = false;
+        kiln_offset_source_count = 0;
+        memset(kiln_offset_sources, 0, sizeof(kiln_offset_sources));
 
         FILE * file = fopen(path, "rb");
         if (file != NULL) {
@@ -1858,24 +1870,71 @@ static bool kiln_offset_lookup(
             if (fstat(fileno(file), &opened) == 0 &&
                     kiln_offset_same_metadata(&st, &opened) &&
                     fgets(header, sizeof(header), file) != NULL &&
-                    strcmp(header, "KILN-MOE-STREAM-1\n") == 0) {
+                    (strcmp(header, "KILN-MOE-STREAM-1\n") == 0 ||
+                     strcmp(header, "KILN-MOE-STREAM-2\n") == 0)) {
+                const bool multi_source = strcmp(header, "KILN-MOE-STREAM-2\n") == 0;
+                bool source_header_valid = true;
+                unsigned int source_count = 0;
+                if (multi_source) {
+                    char source_header[128];
+                    char extra = 0;
+                    if (fgets(source_header, sizeof(source_header), file) == NULL ||
+                            sscanf(source_header, "SOURCES\t%u %c", &source_count, &extra) != 1 ||
+                            source_count == 0 || source_count > KILN_MOE_MAX_SOURCES) {
+                        source_header_valid = false;
+                    }
+                    // Only canonical absolute paths from the private per-model
+                    // index are accepted. Reject tabs/newlines and partial lines.
+                    for (unsigned int source = 0; source_header_valid && source < source_count; ++source) {
+                        char line[PATH_MAX + 64];
+                        unsigned int id = UINT_MAX;
+                        int cursor = 0;
+                        if (fgets(line, sizeof(line), file) == NULL ||
+                                sscanf(line, "SOURCE\t%u\t%n", &id, &cursor) != 1 ||
+                                cursor <= 0 || id != source) {
+                            source_header_valid = false;
+                            break;
+                        }
+                        char * source_name = line + cursor;
+                        size_t length = strlen(source_name);
+                        if (length <= 2 || source_name[length - 1] != '\n' ||
+                                length >= PATH_MAX || source_name[0] != '/' ||
+                                memchr(source_name, '\t', length) != NULL ||
+                                memchr(source_name, '\r', length) != NULL) {
+                            source_header_valid = false;
+                            break;
+                        }
+                        source_name[length - 1] = '\0';
+                        memcpy(kiln_offset_sources[source], source_name, length);
+                    }
+                    char data_header[64];
+                    if (!source_header_valid || fgets(data_header, sizeof(data_header), file) == NULL ||
+                            strcmp(data_header, "DATA\n") != 0) {
+                        source_header_valid = false;
+                    }
+                }
                 const size_t max_entries = 300000;
                 size_t capacity = 1024;
                 size_t count = 0;
                 struct kiln_moe_offset_entry * entries =
                     malloc(capacity * sizeof(*entries));
-                bool good = entries != NULL;
+                bool good = entries != NULL && source_header_valid;
                 char line[256];
                 while (good && fgets(line, sizeof(line), file) != NULL) {
                     struct kiln_moe_offset_entry entry = {0};
                     unsigned long long begin = 0;
                     unsigned long long bytes = 0;
                     char garbage;
-                    int parsed = sscanf(line, "%63[^\t]\t%u\t%llu\t%llu %c",
-                        entry.name, &entry.expert_id, &begin, &bytes, &garbage);
-                    if (parsed != 4 || bytes == 0 ||
+                    int parsed = multi_source ?
+                        sscanf(line, "%63[^\t]\t%u\t%u\t%llu\t%llu %c",
+                            entry.name, &entry.expert_id, &entry.source_id,
+                            &begin, &bytes, &garbage) :
+                        sscanf(line, "%63[^\t]\t%u\t%llu\t%llu %c",
+                            entry.name, &entry.expert_id, &begin, &bytes, &garbage);
+                    if (parsed != (multi_source ? 5 : 4) || bytes == 0 ||
+                            (multi_source && entry.source_id >= source_count) ||
                             begin > UINT64_MAX - bytes ||
-                            strlen(line) == sizeof(line) - 1 && line[sizeof(line) - 2] != '\n') {
+                            (strlen(line) == sizeof(line) - 1 && line[sizeof(line) - 2] != '\n')) {
                         good = false;
                         break;
                     }
@@ -1918,6 +1977,8 @@ static bool kiln_offset_lookup(
                         kiln_offset_entries = entries;
                         kiln_offset_count = count;
                         kiln_offset_metadata = st;
+                        kiln_offset_multi_source = multi_source;
+                        kiln_offset_source_count = multi_source ? source_count : 0;
                         kiln_offset_valid = true;
                     } else {
                         free(entries);
@@ -1942,7 +2003,15 @@ static bool kiln_offset_lookup(
             if (value != NULL) {
                 *offset = value->offset;
                 *length = value->size;
-                found = true;
+                *source_id = value->source_id;
+                if (!kiln_offset_multi_source) {
+                    if (source_path_capacity > 0) { source_path[0] = '\0'; }
+                    found = true;
+                } else if (value->source_id < kiln_offset_source_count &&
+                        source_path_capacity > strlen(kiln_offset_sources[value->source_id])) {
+                    strcpy(source_path, kiln_offset_sources[value->source_id]);
+                    found = true;
+                }
             }
         }
     }
