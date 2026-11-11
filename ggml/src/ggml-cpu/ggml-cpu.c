@@ -2088,6 +2088,11 @@ static struct kiln_stream_audit kiln_stream_selected(
         return audit;
     }
     const uint64_t blob_size = (uint64_t) st.st_size;
+    int source_fds[KILN_MOE_MAX_SOURCES];
+    struct stat source_stats[KILN_MOE_MAX_SOURCES];
+    for (size_t i = 0; i < KILN_MOE_MAX_SOURCES; ++i) {
+        source_fds[i] = -1;
+    }
     size_t allocated = 0;
     for (int64_t selected_id = 0; selected_id < weights->ne[2]; ++selected_id) {
         const unsigned int id = (unsigned int) selected_id;
@@ -2098,27 +2103,50 @@ static struct kiln_stream_audit kiln_stream_selected(
         }
         uint64_t offset = 0;
         uint64_t length = 0;
-        if (!kiln_offset_lookup(index_file, weights->name, id, &offset, &length)) {
+        unsigned int source_id = 0;
+        char source_path[PATH_MAX] = {0};
+        if (!kiln_offset_lookup(index_file, weights->name, id,
+                &offset, &length, &source_id, source_path, sizeof(source_path))) {
             continue;
         }
+        int selected_fd = fd;
+        struct stat selected_stat = st;
+        uint64_t selected_size = blob_size;
+        if (source_path[0] != '\0') {
+            if (source_id >= KILN_MOE_MAX_SOURCES) { continue; }
+            if (source_fds[source_id] < 0) {
+                int candidate = open(source_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+                struct stat checked;
+                if (candidate < 0 || fstat(candidate, &checked) != 0 ||
+                        !S_ISREG(checked.st_mode) || checked.st_size <= 0) {
+                    if (candidate >= 0) { close(candidate); }
+                    continue;
+                }
+                source_fds[source_id] = candidate;
+                source_stats[source_id] = checked;
+            }
+            selected_fd = source_fds[source_id];
+            selected_stat = source_stats[source_id];
+            selected_size = (uint64_t) selected_stat.st_size;
+        }
         if (length != (uint64_t) expert_bytes ||
-                offset > blob_size || length > blob_size - offset ||
+                offset > selected_size || length > selected_size - offset ||
                 offset > (uint64_t) INT64_MAX - length ||
                 expert_bytes > max_bytes - allocated) {
             continue;
         }
-        void * data = kiln_cache_lookup(&st, offset, expert_bytes);
+        void * data = kiln_cache_lookup(&selected_stat, offset, expert_bytes);
         bool pread_needed = data == NULL;
         if (pread_needed) {
             if (posix_memalign(&data, 64, expert_bytes) != 0 || data == NULL) {
                 continue;
             }
-            if (!kiln_stream_read_all(fd, data, offset, expert_bytes)) {
+            if (!kiln_stream_read_all(selected_fd, data, offset, expert_bytes)) {
                 free(data);
                 continue;
             }
             audit.pread_bytes += expert_bytes;
-            data = kiln_cache_admit(&st, offset, expert_bytes, data);
+            data = kiln_cache_admit(&selected_stat, offset, expert_bytes, data);
         } else {
             audit.hot_cache_hits++;
         }
@@ -2128,6 +2156,9 @@ static struct kiln_stream_audit kiln_stream_selected(
         allocated += expert_bytes;
     }
     close(fd);
+    for (size_t i = 0; i < KILN_MOE_MAX_SOURCES; ++i) {
+        if (source_fds[i] >= 0) { close(source_fds[i]); }
+    }
     const char * evidence = getenv("KILN_MOE_STREAM_AUDIT");
     if (evidence != NULL && evidence[0] != '\0') {
         FILE * output = fopen(evidence, "a");
