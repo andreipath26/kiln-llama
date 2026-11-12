@@ -1499,6 +1499,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    capture_clad_attention(params.capture_clad_attention),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -2735,7 +2736,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // CLAD uses the average attention probabilities from LLaDA's last four layers.
         // Keep these as graph outputs only for LLaDA; callers can retrieve the most
         // recent map through llama_get_clad_attention().
-        if (arch == LLM_ARCH_LLADA && il >= n_layer - 4) {
+        if (capture_clad_attention && arch == LLM_ARCH_LLADA && il >= n_layer - 4) {
             res->t_clad_attn.push_back(kq);
         }
 
