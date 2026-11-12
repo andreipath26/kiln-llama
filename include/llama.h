@@ -1152,6 +1152,7 @@ extern "C" {
     // average attention probabilities from the model's last four layers,
     // averaged over heads, laid out as [query][key] for the most recent decode.
     // Returns 0 when the current context did not produce a CLAD attention map.
+    LLAMA_API void llama_set_clad_attention_capture(struct llama_context * ctx, bool enable);
     LLAMA_API uint32_t llama_get_clad_attention_tokens(struct llama_context * ctx);
     LLAMA_API size_t llama_get_clad_attention(
             struct llama_context * ctx, float * dst, size_t capacity);
