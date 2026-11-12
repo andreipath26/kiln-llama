@@ -1148,6 +1148,14 @@ extern "C" {
     // shape: [n_outputs*n_embd]
     // Otherwise, returns NULL.
     // TODO: deprecate in favor of llama_get_embeddings_ith() (ref: https://github.com/ggml-org/llama.cpp/pull/14853#issuecomment-3113143522)
+    // CLAD helper for non-causal LLaDA decoding. The matrix contains the
+    // average attention probabilities from the model's last four layers,
+    // averaged over heads, laid out as [query][key] for the most recent decode.
+    // Returns 0 when the current context did not produce a CLAD attention map.
+    LLAMA_API uint32_t llama_get_clad_attention_tokens(struct llama_context * ctx);
+    LLAMA_API size_t llama_get_clad_attention(
+            struct llama_context * ctx, float * dst, size_t capacity);
+
     LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 
     // Get the embeddings for the ith token. For positive indices, Equivalent to:
