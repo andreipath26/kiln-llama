@@ -1262,6 +1262,17 @@ void llama_context::set_causal_attn(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_clad_attention_capture(bool value) {
+    if (capture_clad_attention == value) {
+        return;
+    }
+    capture_clad_attention = value;
+    clad_attention.clear();
+    n_clad_attention_tokens = 0;
+    // The attention outputs change graph topology. Force a fresh graph on the next decode.
+    gf_res_prev_active = nullptr;
+}
+
 bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
 }
@@ -2628,6 +2639,7 @@ llm_graph_params llama_context::graph_params(
                           llm_graph_type   gtype) const {
     return {
         /*.arch        =*/ model.arch,
+        /*.capture_clad_attention =*/ capture_clad_attention,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
@@ -4017,6 +4029,12 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_set_clad_attention_capture(llama_context * ctx, bool enable) {
+    if (ctx) {
+        ctx->set_clad_attention_capture(enable);
+    }
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
