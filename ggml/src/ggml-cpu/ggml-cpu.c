@@ -1633,7 +1633,7 @@ static void * kiln_stream_get_slot(char (*slots)[CACHE_LINE_SIZE], int id) {
     return ptr;
 }
 
-// Process-local, byte-bounded LRU for immutable external GGUF expert slabs.
+// Process-local, byte-bounded LRU/LFU for immutable external GGUF expert slabs.
 // Keyed by the actual file identity and byte range, not just a tensor name.
 // In-use entries are pinned until the full MMID threadpool barrier completes.
 // Disabled automatically when expert streaming is not explicitly enabled.
@@ -1647,6 +1647,7 @@ struct kiln_cached_moe_slab {
     size_t size;
     unsigned int references;
     uint64_t touched;
+    uint64_t frequency;
     void * data;
     struct kiln_cached_moe_slab * next;
 };
@@ -1665,6 +1666,23 @@ static void kiln_cache_lock(void) {
 
 static void kiln_cache_unlock(void) {
     atomic_flag_clear_explicit(&kiln_cache_lock_flag, memory_order_release);
+}
+
+enum kiln_moe_cache_policy {
+    KILN_MOE_CACHE_LRU,
+    KILN_MOE_CACHE_LFU,
+    KILN_MOE_CACHE_INVALID,
+};
+
+static enum kiln_moe_cache_policy kiln_cache_policy(void) {
+    const char * value = getenv("KILN_MOE_STREAM_CACHE_POLICY");
+    if (value == NULL || value[0] == '\0' || strcmp(value, "lru") == 0) {
+        return KILN_MOE_CACHE_LRU;
+    }
+    if (strcmp(value, "lfu") == 0) {
+        return KILN_MOE_CACHE_LFU;
+    }
+    return KILN_MOE_CACHE_INVALID;
 }
 
 static size_t kiln_cache_budget(void) {
@@ -1700,7 +1718,8 @@ static void * kiln_cache_lookup(
         const struct stat * metadata, uint64_t offset, size_t bytes) {
     // An explicit zero-cache configuration must never reuse resident slabs
     // even when a different model context populated the process-wide cache.
-    if (kiln_cache_budget() == 0) {
+    const enum kiln_moe_cache_policy policy = kiln_cache_policy();
+    if (kiln_cache_budget() == 0 || policy == KILN_MOE_CACHE_INVALID) {
         return NULL;
     }
     kiln_cache_lock();
@@ -1708,6 +1727,9 @@ static void * kiln_cache_lookup(
         if (kiln_cache_identity_matches(p, metadata, offset, bytes)) {
             p->references += 1;
             p->touched = ++kiln_cache_clock;
+            if (policy == KILN_MOE_CACHE_LFU && p->frequency != UINT64_MAX) {
+                p->frequency += 1;
+            }
             void * found = p->data;
             kiln_cache_unlock();
             return found;
@@ -1721,7 +1743,8 @@ static void * kiln_cache_admit(
         const struct stat * metadata, uint64_t offset, size_t bytes,
         void * freshly_read) {
     const size_t budget = kiln_cache_budget();
-    if (bytes > budget || budget == 0) {
+    const enum kiln_moe_cache_policy policy = kiln_cache_policy();
+    if (bytes > budget || budget == 0 || policy == KILN_MOE_CACHE_INVALID) {
         return freshly_read; // caller releases transient allocation normally
     }
     kiln_cache_lock();
@@ -1731,6 +1754,9 @@ static void * kiln_cache_admit(
         if (kiln_cache_identity_matches(p, metadata, offset, bytes)) {
             p->references += 1;
             p->touched = ++kiln_cache_clock;
+            if (policy == KILN_MOE_CACHE_LFU && p->frequency != UINT64_MAX) {
+                p->frequency += 1;
+            }
             void * existing = p->data;
             kiln_cache_unlock();
             free(freshly_read);
@@ -1738,22 +1764,33 @@ static void * kiln_cache_admit(
         }
     }
     while (kiln_cache_bytes > budget - bytes) {
-        struct kiln_cached_moe_slab ** oldest_link = NULL;
+        struct kiln_cached_moe_slab ** victim_link = NULL;
         struct kiln_cached_moe_slab ** current = &kiln_cache_head;
+        uint64_t least_frequency = UINT64_MAX;
         uint64_t oldest_touch = UINT64_MAX;
         while (*current != NULL) {
-            if ((*current)->references == 0 && (*current)->touched < oldest_touch) {
-                oldest_touch = (*current)->touched;
-                oldest_link = current;
+            struct kiln_cached_moe_slab * candidate = *current;
+            if (candidate->references == 0) {
+                const uint64_t score = policy == KILN_MOE_CACHE_LFU ?
+                    candidate->frequency : 0;
+                const bool better = policy == KILN_MOE_CACHE_LRU ?
+                    candidate->touched < oldest_touch :
+                    (score < least_frequency ||
+                     (score == least_frequency && candidate->touched < oldest_touch));
+                if (better) {
+                    least_frequency = score;
+                    oldest_touch = candidate->touched;
+                    victim_link = current;
+                }
             }
             current = &(*current)->next;
         }
-        if (oldest_link == NULL) {
+        if (victim_link == NULL) {
             kiln_cache_unlock();
             return freshly_read; // every possible victim is pinned by inference
         }
-        struct kiln_cached_moe_slab * victim = *oldest_link;
-        *oldest_link = victim->next;
+        struct kiln_cached_moe_slab * victim = *victim_link;
+        *victim_link = victim->next;
         kiln_cache_bytes -= victim->size;
         free(victim->data);
         free(victim);
@@ -1773,6 +1810,7 @@ static void * kiln_cache_admit(
         .size = bytes,
         .references = 1,
         .touched = ++kiln_cache_clock,
+        .frequency = 1,
         .data = freshly_read,
         .next = kiln_cache_head,
     };
