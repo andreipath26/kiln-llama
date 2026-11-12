@@ -1327,6 +1327,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_clad_attn.clear();
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1398,6 +1399,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         }
     }
     for (auto * tensor : t_candidates) {
+        if (tensor != nullptr) {
+            ggml_set_output(tensor);
+        }
+    }
+    for (auto * tensor : t_clad_attn) {
         if (tensor != nullptr) {
             ggml_set_output(tensor);
         }
@@ -1493,6 +1499,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    capture_clad_attention(params.capture_clad_attention),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -2726,6 +2733,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
+        // CLAD uses the average attention probabilities from LLaDA's last four layers.
+        // Keep these as graph outputs only for LLaDA; callers can retrieve the most
+        // recent map through llama_get_clad_attention().
+        if (capture_clad_attention && arch == LLM_ARCH_LLADA && il >= n_layer - 4) {
+            res->t_clad_attn.push_back(kq);
+        }
 
         if (!v_trans) {
             // note: avoid this branch

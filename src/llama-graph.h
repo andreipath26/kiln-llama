@@ -772,6 +772,7 @@ class llm_graph_result;
 
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
+    bool capture_clad_attention = false;
 
     llama_hparams hparams;
     llama_cparams cparams;
@@ -816,6 +817,10 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (capture_clad_attention != other.capture_clad_attention) {
+            return false;
+        }
+
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -946,6 +951,8 @@ public:
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
     std::vector<ggml_tensor *> t_candidates;
+    // Last four LLaDA layer attention maps used by KILN's CLAD decoder.
+    std::vector<ggml_tensor *> t_clad_attn;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1035,6 +1042,7 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+    const bool capture_clad_attention;
 
     llm_graph_result * res;
 

@@ -80,6 +80,9 @@ struct llama_context {
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();
+    void set_clad_attention_capture(bool value);
+    const std::vector<float> & get_clad_attention() const { return clad_attention; }
+    uint32_t get_clad_attention_tokens() const { return n_clad_attention_tokens; }
     float * get_logits_ith(int32_t i);
 
     float * get_embeddings();
@@ -296,6 +299,11 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    // LLaDA attention, averaged across heads and its last four layers [query][key].
+    std::vector<float> clad_attention;
+    uint32_t n_clad_attention_tokens = 0;
+    bool capture_clad_attention = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
