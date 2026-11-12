@@ -1934,16 +1934,16 @@ static bool kiln_offset_lookup(
                             break;
                         }
                         char * source_name = line + cursor;
-                        size_t length = strlen(source_name);
-                        if (length <= 2 || source_name[length - 1] != '\n' ||
-                                length >= PATH_MAX || source_name[0] != '/' ||
-                                memchr(source_name, '\t', length) != NULL ||
-                                memchr(source_name, '\r', length) != NULL) {
+                        size_t source_name_length = strlen(source_name);
+                        if (source_name_length <= 2 || source_name[source_name_length - 1] != '\n' ||
+                                source_name_length >= PATH_MAX || source_name[0] != '/' ||
+                                memchr(source_name, '\t', source_name_length) != NULL ||
+                                memchr(source_name, '\r', source_name_length) != NULL) {
                             source_header_valid = false;
                             break;
                         }
-                        source_name[length - 1] = '\0';
-                        memcpy(kiln_offset_sources[source], source_name, length);
+                        source_name[source_name_length - 1] = '\0';
+                        memcpy(kiln_offset_sources[source], source_name, source_name_length);
                     }
                     char data_header[64];
                     if (!source_header_valid || fgets(data_header, sizeof(data_header), file) == NULL ||
