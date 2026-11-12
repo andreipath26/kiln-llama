@@ -1465,6 +1465,48 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // Materialize the attention maps for CLAD. KILN's LLaDA path runs one
+    // full, non-causal sequence per decode, so the exported matrix is [query][key].
+    if (!res->t_clad_attn.empty()) {
+        const uint32_t n = ubatch.n_tokens;
+        bool valid = n > 0;
+        std::vector<float> averaged((size_t) n * n, 0.0f);
+        size_t layer_count = 0;
+        for (ggml_tensor * tensor : res->t_clad_attn) {
+            if (!tensor || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+                tensor->ne[0] != n || tensor->ne[1] != n || tensor->ne[2] <= 0 || tensor->ne[3] != 1) {
+                valid = false;
+                break;
+            }
+            const size_t head_count = (size_t) tensor->ne[2];
+            std::vector<float> raw((size_t) ggml_nelements(tensor));
+            ggml_backend_tensor_get(tensor, raw.data(), 0, ggml_nbytes(tensor));
+            for (uint32_t query = 0; query < n; ++query) {
+                for (uint32_t key = 0; key < n; ++key) {
+                    float head_sum = 0.0f;
+                    for (size_t head = 0; head < head_count; ++head) {
+                        const size_t idx = key + (size_t) n * query + (size_t) n * n * head;
+                        head_sum += raw[idx];
+                    }
+                    averaged[(size_t) query * n + key] += head_sum / (float) head_count;
+                }
+            }
+            ++layer_count;
+        }
+        if (valid && layer_count > 0) {
+            const float inv_layers = 1.0f / (float) layer_count;
+            for (float & value : averaged) value *= inv_layers;
+            clad_attention = std::move(averaged);
+            n_clad_attention_tokens = n;
+        } else {
+            clad_attention.clear();
+            n_clad_attention_tokens = 0;
+        }
+    } else {
+        clad_attention.clear();
+        n_clad_attention_tokens = 0;
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -4011,6 +4053,21 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+uint32_t llama_get_clad_attention_tokens(llama_context * ctx) {
+    if (!ctx) return 0;
+    ctx->synchronize();
+    return ctx->get_clad_attention_tokens();
+}
+
+size_t llama_get_clad_attention(llama_context * ctx, float * dst, size_t capacity) {
+    if (!ctx || !dst) return 0;
+    ctx->synchronize();
+    const auto & attention = ctx->get_clad_attention();
+    if (capacity < attention.size()) return 0;
+    memcpy(dst, attention.data(), attention.size() * sizeof(float));
+    return attention.size();
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
