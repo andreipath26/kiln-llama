@@ -15,8 +15,11 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -4474,9 +4477,27 @@ int32_t llama_encode(
     return ret;
 }
 
+static std::mutex kiln_router_trace_decode_mutex;
+static uint64_t kiln_router_trace_decode_sequence = 0;
+
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    // The optional Phase 5A trace needs explicit decode-call boundaries so
+    // offline replay can collapse repeated MAT_ID projections for the same
+    // (decode, batch row, layer, expert). Serialize only trace-enabled decode
+    // calls; ordinary inference never takes this lock or writes markers.
+    const char * trace_path = std::getenv("KILN_MOE_ROUTER_TRACE");
+    std::unique_lock<std::mutex> trace_lock(kiln_router_trace_decode_mutex, std::defer_lock);
+    if (trace_path != nullptr && trace_path[0] != '\0' && batch.n_tokens > 0) {
+        trace_lock.lock();
+        FILE * trace = std::fopen(trace_path, "a");
+        if (trace != nullptr) {
+            const uint64_t sequence = ++kiln_router_trace_decode_sequence;
+            std::fprintf(trace, "@decode\t%" PRIu64 "\t%d\n", sequence, batch.n_tokens);
+            std::fclose(trace);
+        }
+    }
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
